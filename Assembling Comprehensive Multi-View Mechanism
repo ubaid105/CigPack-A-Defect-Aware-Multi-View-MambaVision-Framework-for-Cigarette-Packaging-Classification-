@@ -1,0 +1,48 @@
+
+# SECTION 8: ASSEMBLING COMPREHENSIVE MULTI-VIEW RETRIEVAL SCHEMA
+
+
+import os
+import pandas as pd
+
+print("=" * 85)
+print("SECTION 8: ASSEMBLING COMPREHENSIVE MULTI-VIEW RETRIEVAL SCHEMA")
+print("=" * 85)
+
+
+if 'FINAL_CLEAN_CSV' not in globals():
+    raise NameError("❌ Global path variable 'FINAL_CLEAN_CSV' not found! Please run the Master Configuration cell first.")
+
+print(f"📌 Loading pre-synthesized multi-view metadata from:\n   {FINAL_CLEAN_CSV}")
+
+if not os.path.exists(FINAL_CLEAN_CSV):
+    raise FileNotFoundError(f"❌ Multi-view metadata file missing at {FINAL_CLEAN_CSV}. Please run the dataset restructuring script first.")
+
+df_multiview = pd.read_csv(FINAL_CLEAN_CSV)
+
+if df_multiview.empty:
+    raise ValueError("❌ Error: The loaded multi-view dataset is empty.")
+
+
+train_df = df_multiview[df_multiview['split'] == 'train'].reset_index(drop=True)
+val_df   = df_multiview[df_multiview['split'] == 'val'].reset_index(drop=True)
+test_df  = df_multiview[df_multiview['split'] == 'test'].reset_index(drop=True)
+
+print("\n🎉 MULTI-VIEW RETRIEVAL SCHEMA LOADED SUCCESSFULLY:")
+print(f"   • Total Mapped Image Frames:        {len(df_multiview):,}")
+print(f"   • Total Unique Synchronized Boxes:  {df_multiview['box_id'].nunique():,}")
+print("-" * 65)
+print("📊 Split Distribution (Unique Boxes):")
+print(df_multiview.groupby('split')['box_id'].nunique().to_string())
+print("-" * 65)
+print(f"📦 Verified Split Breakdown (View Frames):")
+print(f"   • Train Views: {len(train_df):,} (Boxes: {train_df['box_id'].nunique():,})")
+print(f"   • Val Views:   {len(val_df):,} (Boxes: {val_df['box_id'].nunique():,})")
+print(f"   • Test Views:  {len(test_df):,} (Boxes: {test_df['box_id'].nunique():,})")
+print("-" * 65)
+print("📋 Verified Schema Columns:")
+print(list(df_multiview.columns))
+
+# Display top 10 records preview sample
+print("\n🔍 First 10 Records Preview Sample:")
+print(df_multiview.head(10).to_string(index=False))
