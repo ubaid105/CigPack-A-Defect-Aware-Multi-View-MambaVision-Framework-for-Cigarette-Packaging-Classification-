@@ -1,0 +1,34 @@
+# MASTER CONFIGURATION & GLOBAL DRIVE PATH REGISTRY
+import os
+
+print("📌 Initializing Master Path Configurations & Global Variables...")
+PROJECT_DIR = "/content/drive/MyDrive/Packing_Project"
+os.makedirs(PROJECT_DIR, exist_ok=True)
+UNZIPPED_DIR = os.path.join(PROJECT_DIR, "extracted_images/unzipped_images")
+INPUT_CSV = os.path.join(PROJECT_DIR, "final_dataset_corrected.csv")
+
+MASTER_BASELINE_CSV = os.path.join(PROJECT_DIR, "master_10_model_baseline_results.csv")
+MAMBA_CSV           = os.path.join(PROJECT_DIR, "mambavision_baseline_results.csv")
+SWIN_CSV            = os.path.join(PROJECT_DIR, "swin_baseline_results.csv")
+YOLO_CSV            = os.path.join(PROJECT_DIR, "yolov8_baseline_results.csv")
+
+FINAL_CLEAN_CSV       = os.path.join(PROJECT_DIR, "multiview_dataset_metadata_final_clean.csv")
+
+PROPOSED_CHECKPOINT    = os.path.join(PROJECT_DIR, "proposed_mambavision_checkpoint.pth")
+PROPOSED_FINAL_WEIGHTS = os.path.join(PROJECT_DIR, "proposed_mambavision_final.pth")
+PROPOSED_RESULTS_CSV   = os.path.join(PROJECT_DIR, "proposed_mambavision_results.csv")
+
+
+CLASS_LABELS = ["Damaged packing", "Deformed packing", "Good packing"]
+NUM_CLASSES  = len(CLASS_LABELS)
+SEVERITY_RANK = {'Good packing': 0, 'Damaged packing': 1, 'Deformed packing': 2}
+VIEW_NAMES = ['front', 'back', 'left', 'right', 'top', 'bottom']
+
+print("✅ Master Path Registry successfully initialized in global runtime memory:")
+print(f"   • Project Root Dir:     {PROJECT_DIR}")
+print(f"   • Unzipped Images:      {UNZIPPED_DIR}")
+print(f"   • Raw Corrected CSV:    {INPUT_CSV}")
+print(f"   • Final Multi-View CSV: {FINAL_CLEAN_CSV}")
+print(f"   • Checkpoint Path:      {PROPOSED_CHECKPOINT}")
+print(f"   • Results Path:         {PROPOSED_RESULTS_CSV}")
+print(f"   • Target Classes:       {CLASS_LABELS} (Total: {NUM_CLASSES})")
