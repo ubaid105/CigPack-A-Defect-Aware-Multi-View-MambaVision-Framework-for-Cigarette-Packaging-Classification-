@@ -1,0 +1,125 @@
+# SECTION 13 — CELL 2: TRUE GRAD-CAM (SPATIAL ATTENTION HEATMAPS)
+print("\n🎨 Part 2: Generating Multi-View Grad-CAM Spatial Heatmaps...")
+
+def find_last_conv_layer(module):
+
+    last_conv, last_name = None, None
+    for name, sub in module.named_modules():
+        if isinstance(sub, nn.Conv2d):
+            last_conv, last_name = sub, name
+    return last_conv, last_name
+
+target_layer, target_layer_name = find_last_conv_layer(proposed_model.shared_backbone)
+if target_layer is None:
+    raise RuntimeError(
+        "No Conv2d layer found inside shared_backbone — print(proposed_model.shared_backbone) "
+        "to inspect its structure and pick a spatial layer manually."
+    )
+print(f"✅ Grad-CAM target layer resolved to: shared_backbone.{target_layer_name}")
+
+
+class DynamicGradCAMHook:
+    def __init__(self, layer):
+        self.activations = None
+        self.gradients = None
+        self.fwd_handle = layer.register_forward_hook(self._save_activation)
+        self.bwd_handle = layer.register_full_backward_hook(self._save_gradient)
+
+    def _save_activation(self, module, inp, out):
+        self.activations = out.detach()
+
+    def _save_gradient(self, module, grad_in, grad_out):
+        self.gradients = grad_out[0].detach()
+
+    def remove(self):
+        self.fwd_handle.remove()
+        self.bwd_handle.remove()
+
+
+def execute_multiview_gradcam(model, sample_batch, layer, target_class=None):
+    model.eval()
+    hook = DynamicGradCAMHook(layer)
+    try:
+        inputs, labels = sample_batch
+        inputs = inputs.to(DEVICE)
+        output = model(inputs)
+        logits = output['logits'] if isinstance(output, dict) else output
+
+        if target_class is None:
+            target_class = torch.argmax(logits, dim=1).item()
+
+        score = logits[0, target_class]
+        model.zero_grad()
+        score.backward()
+
+        acts = hook.activations
+        grads = hook.gradients
+
+        if acts.dim() == 4:
+            weights = grads.mean(dim=(2, 3), keepdim=True)
+            cam = torch.relu((weights * acts).sum(dim=1))
+        elif acts.dim() == 3:
+            weights = grads.mean(dim=1, keepdim=True)
+            cam = torch.relu((weights * acts).sum(dim=2))
+            side_len = int(np.sqrt(cam.shape[-1]))
+            if side_len * side_len == cam.shape[-1]:
+                cam = cam.view(cam.shape[0], side_len, side_len)
+            else:
+                cam = cam.view(cam.shape[0], 1, -1)
+        else:
+            cam = torch.relu(acts.mean(dim=1))
+
+        cam = cam.cpu().numpy()
+        cam_heatmaps = []
+        for v in range(cam.shape[0]):
+            c = cam[v]
+            if c.max() > c.min():
+                c = (c - c.min()) / (c.max() - c.min())
+            cam_heatmaps.append(c)
+
+        imgs = inputs.data.cpu().numpy()[0]
+        return imgs, cam_heatmaps, target_class
+    finally:
+        hook.remove()
+
+
+inputs, labels = next(iter(test_loader))
+single_sample = (inputs[0:1], labels[0:1])
+imgs, heatmaps, pred_cls = execute_multiview_gradcam(proposed_model, single_sample, target_layer)
+
+fig, axes = plt.subplots(2, NUM_VIEWS, figsize=(3 * NUM_VIEWS, 6), dpi=300)
+for v in range(NUM_VIEWS):
+    rgb_img = imgs[v] * std_norm + mean_norm
+    rgb_img = np.clip(rgb_img.transpose(1, 2, 0), 0, 1)
+
+    h_map = heatmaps[v]
+    if h_map.ndim == 1:
+        side = int(np.sqrt(h_map.shape[0]))
+        h_map = np.tile(h_map, (side, side))[:side, :side]
+    h_map = np.asarray(h_map, dtype=np.float32)
+
+    heatmap_resized = cv2.resize(h_map, (IMG_RESOLUTION, IMG_RESOLUTION))
+    heatmap_colored = cv2.applyColorMap(np.uint8(255 * heatmap_resized), cv2.COLORMAP_JET)
+    heatmap_colored = cv2.cvtColor(heatmap_colored, cv2.COLOR_BGR2RGB) / 255.0
+
+    overlay = 0.6 * rgb_img + 0.4 * heatmap_colored
+    overlay = np.clip(overlay, 0, 1)
+
+    axes[0, v].imshow(rgb_img)
+    axes[0, v].set_title(f"Camera: {VIEW_NAMES[v]}", fontsize=11, fontweight='bold', color='#2C3E50')
+    axes[0, v].axis('off')
+
+    axes[1, v].imshow(overlay)
+    axes[1, v].set_title(f"Spatial Attention", fontsize=11, fontweight='bold', color='#C0392B')
+    axes[1, v].axis('off')
+
+predicted_label_name = CLASS_NAMES[pred_cls]
+plt.suptitle(f"Multi-View Defect Spatial Attention Heatmap Panel | Network Prediction: [{predicted_label_name}]",
+             fontsize=16, fontweight='bold', y=1.05, color='#1A252F')
+plt.tight_layout()
+plt.savefig(GRADCAM_PLOT, dpi=300, bbox_inches='tight')
+plt.show()
+
+print(f"\n✅ Section 13 Complete. Explainability and Robustness artifacts exported directly to Google Drive:"
+      f"\n   • Hardware Stress Plot : {STRESS_PLOT}"
+      f"\n   • Grad-CAM Heatmaps    : {GRADCAM_PLOT}")
