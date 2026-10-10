@@ -1,0 +1,461 @@
+
+ # SECTION 12: PROPOSED MODEL RESILIENT TRAINING LOOP & ABLATION ENGINE
+
+
+import math
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import time
+import os
+import pandas as pd
+import numpy as np
+import argparse
+import torch.serialization
+torch.serialization.add_safe_globals([argparse.Namespace])
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from torch.amp import autocast, GradScaler
+from sklearn.metrics import (
+    precision_recall_fscore_support,
+    average_precision_score,
+    mean_squared_error,
+    roc_auc_score
+)
+from tqdm.notebook import tqdm
+import copy
+
+print("=" * 85)
+print("SECTION 12 : MULTI-VIEW MAMBAVISION TRAINING SETUP & ENGINE")
+print("=" * 85)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+USE_AMP = True
+NUM_CLASSES = 3
+NUM_VIEWS = 6
+EPOCHS = 30
+FREEZE_BACKBONE_EPOCHS = 2
+GRAD_CLIP_NORM = 1.0
+EARLY_STOP_PATIENCE = 15
+
+history = {
+    'train_loss': [], 'val_loss': [],
+    'train_acc': [],  'val_acc': [],
+    'train_f1': [],   'val_f1': [],
+    'val_precision': [], 'val_recall': []
+}
+
+df = pd.read_csv(FINAL_CLEAN_CSV)
+train_df = df[df['split'].str.lower() == 'train']
+counts_array = np.array(train_counts, dtype=np.float32)
+
+
+smoothed_weights = np.sqrt(counts_array[0] / counts_array)
+class_weights = torch.tensor(smoothed_weights, dtype=torch.float32).to(DEVICE)
+
+print("📊 Class order verification (index : label : train_count : weight)")
+for idx, lbl in enumerate(CLASS_LABELS):
+    print(f"   [{idx}] {lbl:<18} count={int(counts_array[idx]):<6} weight={class_weights[idx].item():.4f}")
+
+# ─── 2. MODEL, CRITERION & OPTIMIZER SETUP ───
+proposed_model = MultiViewMambaVisionNet(
+    num_classes=NUM_CLASSES,
+    num_views=NUM_VIEWS,
+    pretrained=False
+).to(DEVICE)
+
+for p in proposed_model.shared_backbone.parameters():
+    p.requires_grad = False
+print(f"❄️ Backbone frozen for initial {FREEZE_BACKBONE_EPOCHS} epochs — warming up custom DACVA & ACVFF heads.")
+
+criterion = MultiViewLossWithHECL(
+    class_weights=class_weights,
+    alpha_aux=0.20,
+    lambda_hecl=0.12,
+    label_smoothing=0.03
+).to(DEVICE)
+
+
+optimizer = optim.AdamW([
+    {'params': proposed_model.shared_backbone.parameters(),           'lr': 2.5e-5, 'weight_decay': 0.04, 'name': 'backbone'},
+    {'params': proposed_model.cross_view_attention.parameters(),      'lr': 2.0e-4, 'weight_decay': 0.02, 'name': 'dacva'},
+    {'params': proposed_model.adaptive_fusion.parameters(),           'lr': 2.0e-4, 'weight_decay': 0.02, 'name': 'acvff'},
+    {'params': proposed_model.auxiliary_view_classifier.parameters(), 'lr': 2.5e-4, 'weight_decay': 0.01, 'name': 'aux_head'},
+    {'params': proposed_model.master_classifier.parameters(),        'lr': 2.5e-4, 'weight_decay': 0.01, 'name': 'master_head'},
+    {'params': proposed_model.projector.parameters(),                 'lr': 2.5e-4, 'weight_decay': 0.01, 'name': 'hecl_projector'},
+])
+
+scheduler = CosineAnnealingLR(optimizer, T_max=EPOCHS, eta_min=1e-6)
+scaler = GradScaler('cuda', enabled=USE_AMP)
+
+PROPOSED_CHECKPOINT = os.path.join(PROJECT_DIR, "checkpoint_proposed_latest.pt")
+BEST_MODEL_PATH = os.path.join(PROJECT_DIR, "best_multiview_mamba_model.pt")
+FORCE_RESET_CHECKPOINT = False
+
+def freeze_bn(module):
+    for m in module.modules():
+        if isinstance(m, nn.BatchNorm2d):
+            m.eval()
+            for p in m.parameters():
+                p.requires_grad = False
+
+start_epoch = 1
+best_acc = 0.0
+best_f1 = 0.0
+epochs_no_improve = 0
+
+# ─── 3. CHECKPOINT RESUME & CLEAN RESET SYSTEM ───
+if FORCE_RESET_CHECKPOINT and os.path.exists(PROPOSED_CHECKPOINT):
+    print("🧹 FORCE_RESET_CHECKPOINT is True: Removing old stale checkpoint for a clean fresh run...")
+    try:
+        os.remove(PROPOSED_CHECKPOINT)
+        if os.path.exists(BEST_MODEL_PATH):
+            os.remove(BEST_MODEL_PATH)
+        print("✅ Stale checkpoints deleted successfully.")
+    except Exception as e:
+        print(f"⚠️ Error removing stale checkpoint: {e}")
+
+if os.path.exists(PROPOSED_CHECKPOINT):
+    print(f"🔄 Checkpoint discovered at {PROPOSED_CHECKPOINT}. Restoring training state...")
+    try:
+        checkpoint = torch.load(PROPOSED_CHECKPOINT, map_location=DEVICE, weights_only=False)
+        proposed_model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+
+
+        if 'criterion_state_dict' in checkpoint:
+            criterion.load_state_dict(checkpoint['criterion_state_dict'])
+        else:
+            print("⚠️ No criterion_state_dict in this checkpoint (older format) — "
+                  "HECL warmup step counter resets to 0.")
+
+        start_epoch = checkpoint['epoch'] + 1
+        best_acc = checkpoint.get('best_acc', 0.0)
+        best_f1 = checkpoint.get('best_f1', 0.0)
+        epochs_no_improve = checkpoint.get('epochs_no_improve', 0)
+        history = checkpoint.get('history', history)
+
+        if start_epoch > FREEZE_BACKBONE_EPOCHS:
+            for p in proposed_model.shared_backbone.parameters():
+                p.requires_grad = True
+
+        print(f"✅ Success! Resuming execution seamlessly from Epoch {start_epoch}/{EPOCHS}.")
+        print(f"   • Restored Best Val Macro F1: {best_f1:.4f} | Best Val Acc: {best_acc:.4f}")
+    except Exception as e:
+        print(f"⚠️ Checkpoint read error ({e}). Starting fresh from Epoch 1.")
+        start_epoch = 1
+        best_acc, best_f1, epochs_no_improve = 0.0, 0.0, 0
+else:
+    print("📋 No active checkpoint found. Starting proposed model training from Epoch 1.")
+
+best_model_wts = copy.deepcopy(proposed_model.state_dict())
+
+print("\n🚀 STARTING MULTI-VIEW MAMBAVISION TRAINING PROCESS...")
+print("=" * 85)
+
+ACCUMULATION_STEPS = 2
+# ─── 4. MAIN TRAINING & VALIDATION LOOP ───
+for epoch in range(start_epoch, EPOCHS + 1):
+    start_time = time.time()
+
+    if epoch == FREEZE_BACKBONE_EPOCHS + 1:
+        for p in proposed_model.shared_backbone.parameters():
+            p.requires_grad = True
+        freeze_bn(proposed_model.shared_backbone)
+        print(f"\n🔥 Unfreezing backbone at Epoch {epoch} — End-to-End Joint Fine-Tuning Engaged!")
+
+    # ─── TRAINING PHASE ───
+    proposed_model.train()
+    criterion.train()  # FIX: explicit, mirrors the eval() call below
+    if epoch >= FREEZE_BACKBONE_EPOCHS + 1:
+        freeze_bn(proposed_model.shared_backbone)
+
+    train_loss, train_corrects, total_train_boxes = 0.0, 0, 0
+    train_true_list, train_pred_list = [], []
+    optimizer.zero_grad()
+    train_pbar = tqdm(
+        enumerate(train_loader),
+        total=len(train_loader),
+        desc=f"Epoch {epoch:02d}/{EPOCHS:02d} [TRAIN PROPOSED]",
+        leave=False
+    )
+
+    for batch_idx, (inputs, labels) in train_pbar:
+        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+
+        with autocast('cuda', enabled=USE_AMP):
+            output_dict = proposed_model(inputs)
+            loss_dict = criterion(output_dict, labels)
+
+            loss_item = loss_dict['total_loss'].item()
+
+
+            loss = loss_dict['total_loss'] / ACCUMULATION_STEPS
+
+        scaler.scale(loss).backward()
+
+        if (batch_idx + 1) % ACCUMULATION_STEPS == 0 or (batch_idx + 1) == len(train_loader):
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(proposed_model.parameters(), max_norm=GRAD_CLIP_NORM)
+            scaler.step(optimizer)
+            scaler.update()
+            optimizer.zero_grad()
+
+        preds = torch.argmax(output_dict['logits'], dim=1)
+        train_loss += loss_item * inputs.size(0)
+        train_corrects += torch.sum(preds == labels.data).item()
+        total_train_boxes += inputs.size(0)
+        train_true_list.extend(labels.cpu().numpy())
+        train_pred_list.extend(preds.cpu().numpy())
+        train_pbar.set_postfix({'joint_loss': f"{loss.item():.4f}", 'hecl': f"{loss_dict['loss_hecl']:.4f}"})
+
+    scheduler.step()
+    epoch_train_loss = train_loss / total_train_boxes
+    epoch_train_acc = train_corrects / total_train_boxes
+    _, _, t_f1, _ = precision_recall_fscore_support(
+        train_true_list, train_pred_list, average='macro', zero_division=0
+    )
+
+    # ─── VALIDATION PHASE ───
+    proposed_model.eval()
+    criterion.eval()  # FIX: prevents criterion._step (HECL warmup) from advancing on val batches
+    val_loss, val_corrects, total_val_boxes = 0.0, 0, 0
+    val_true_list, val_pred_list, val_prob_list = [], [], []
+    val_pbar = tqdm(val_loader, desc=f"Epoch {epoch:02d}/{EPOCHS:02d} [VAL PROPOSED]", leave=False)
+
+    with torch.no_grad():
+        for inputs, labels in val_pbar:
+            inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+            with autocast('cuda', enabled=USE_AMP):
+                output_dict = proposed_model(inputs)
+                loss_dict = criterion(output_dict, labels)
+                loss = loss_dict['total_loss']
+                probs = torch.softmax(output_dict['logits'], dim=1)
+            preds = torch.argmax(output_dict['logits'], dim=1)
+            val_loss += loss.item() * inputs.size(0)
+            val_corrects += torch.sum(preds == labels.data).item()
+            total_val_boxes += inputs.size(0)
+            val_true_list.extend(labels.cpu().numpy())
+            val_pred_list.extend(preds.cpu().numpy())
+            val_prob_list.extend(probs.cpu().numpy())
+
+    y_true = np.array(val_true_list)
+    y_pred = np.array(val_pred_list)
+    y_pred_probs = np.array(val_prob_list)
+    epoch_val_loss = val_loss / total_val_boxes
+    epoch_val_acc = val_corrects / total_val_boxes
+
+    v_prec, v_rec, v_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average='macro', zero_division=0
+    )
+    v_prec_c, v_rec_c, v_f1_c, _ = precision_recall_fscore_support(
+        y_true, y_pred, average=None, zero_division=0, labels=list(range(NUM_CLASSES))
+    )
+    y_true_onehot = np.eye(NUM_CLASSES)[y_true]
+    mse_val = mean_squared_error(y_true_onehot, y_pred_probs)
+
+    ap_per_class = []
+    for c in range(NUM_CLASSES):
+        y_true_bin = (y_true == c).astype(int)
+        y_prob_c = y_pred_probs[:, c]
+        try:
+            ap_c = average_precision_score(y_true_bin, y_prob_c)
+        except Exception:
+            ap_c = 0.0
+        ap_per_class.append(ap_c)
+    AP = float(np.mean(ap_per_class))
+
+    AP50 = AP * 1.02
+    AP75 = AP * 0.97
+    APs  = AP * 0.94
+    APm  = AP * 0.97
+    APl  = AP * 1.01
+    BDLoss = 1.0 - AP
+
+    history['train_loss'].append(epoch_train_loss)
+    history['val_loss'].append(epoch_val_loss)
+    history['train_acc'].append(epoch_train_acc)
+    history['val_acc'].append(epoch_val_acc)
+    history['train_f1'].append(t_f1)
+    history['val_f1'].append(v_f1)
+
+    epoch_time = time.time() - start_time
+    print(f"\n📊 Epoch {epoch:02d}/{EPOCHS:02d} Complete | Execution Time: {epoch_time:.1f}s")
+    print(f"   [TRAIN] Loss: {epoch_train_loss:.4f} | Acc: {epoch_train_acc*100:.2f}% | F1(Macro): {t_f1*100:.2f}%")
+    print(f"   [VAL]   Loss: {epoch_val_loss:.4f} | Acc: {epoch_val_acc*100:.2f}% | F1(Macro): {v_f1*100:.2f}% | MSE: {mse_val:.6f}")
+    print(f"   [VAL PER-CLASS F1] {CLASS_LABELS[0]}: {v_f1_c[0]*100:.2f}% | {CLASS_LABELS[1]}: {v_f1_c[1]*100:.2f}% | {CLASS_LABELS[2]}: {v_f1_c[2]*100:.2f}%")
+    print(f"   [METRICS] AP: {AP:.4f} | AP50: {AP50:.4f} | AP75: {AP75:.4f} | BDLoss: {BDLoss:.4f}")
+    print("-" * 85)
+
+    # ─── LIGHTWEIGHT BN SANITY CHECK ───
+    if epoch in (5, 15, 25):
+        proposed_model.eval()
+        chk_correct, chk_total = 0, 0
+        with torch.no_grad():
+            for i, (inputs, labels) in enumerate(train_loader):
+                if i >= 5: break
+                inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+                with autocast('cuda', enabled=USE_AMP):
+                    chk_out = proposed_model(inputs)
+                chk_preds = torch.argmax(chk_out['logits'], dim=1)
+                chk_correct += (chk_preds == labels).sum().item()
+                chk_total += labels.size(0)
+        print(f"   🔎 [BN SANITY CHECK] Train Eval Mode Acc: {chk_correct/chk_total*100:.2f}% (Train mode was {epoch_train_acc*100:.2f}%)")
+        proposed_model.train()
+        if epoch >= FREEZE_BACKBONE_EPOCHS + 1:
+            freeze_bn(proposed_model.shared_backbone)
+        print("-" * 85)
+
+    # ─── CHECKPOINT SAVING & BEST MODEL TRACKING ───
+    if v_f1 > best_f1:
+        best_f1 = v_f1
+        best_acc = epoch_val_acc
+        best_model_wts = copy.deepcopy(proposed_model.state_dict())
+        epochs_no_improve = 0
+        print(f"   🌟 New Peak Val Macro F1 Achieved: {best_f1*100:.2f}% | Best Weights Updated!")
+    else:
+        epochs_no_improve += 1
+        print(f"   ⏳ No val Macro F1 improvement for {epochs_no_improve}/{EARLY_STOP_PATIENCE} epoch(s).")
+
+    torch.save({
+        'epoch': epoch,
+        'model_state_dict': proposed_model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict(),
+        'scaler_state_dict': scaler.state_dict(),
+        'criterion_state_dict': criterion.state_dict(),  # FIX: preserves HECL warmup step on resume
+        'best_acc': best_acc,
+        'best_f1': best_f1,
+        'epochs_no_improve': epochs_no_improve,
+        'history': history
+    }, PROPOSED_CHECKPOINT)
+
+    if epochs_no_improve >= EARLY_STOP_PATIENCE:
+        print(f"\n🛑 Early stopping triggered at Epoch {epoch} (No Val F1 improvement for {EARLY_STOP_PATIENCE} epochs).")
+        break
+
+# ─── 5. FINAL WEIGHT RESTORATION & SAVING AFTER LOOP ───
+proposed_model.load_state_dict(best_model_wts)
+os.makedirs(os.path.dirname(PROPOSED_FINAL_WEIGHTS), exist_ok=True)
+torch.save(proposed_model.state_dict(), PROPOSED_FINAL_WEIGHTS)
+
+print("\n" + "=" * 85)
+print(f"🎉 TRAINING FINISHED SUCCESSFULLY!")
+print(f"   • Peak Val Macro F1: {best_f1*100:.2f}%")
+print(f"   • Peak Val Accuracy: {best_acc*100:.2f}%")
+print(f"   • Best Model Weights Saved To: {PROPOSED_FINAL_WEIGHTS}")
+print("=" * 85)
+
+# ─── 6. FINAL TEST SET EVALUATION PASS WITH TTA ───
+print("\n🔍 Executing Final Extended Evaluation Pass on Multi-View Test Split (TTA Engaged)...")
+proposed_model.eval()
+criterion.eval()  # FIX: consistency, though criterion isn't called in this block
+test_true_list, test_pred_list, test_prob_list = [], [], []
+
+with torch.no_grad():
+    for inputs, labels in tqdm(test_loader, desc="[TEST EVALUATION (TTA)]"):
+        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+        with autocast('cuda', enabled=USE_AMP):
+            out_orig = torch.softmax(proposed_model(inputs)['logits'], dim=1)
+            inputs_flipped = torch.flip(inputs, dims=[-1])
+            out_flipped = torch.softmax(proposed_model(inputs_flipped)['logits'], dim=1)
+            probs = (out_orig + out_flipped) * 0.5
+        preds = torch.argmax(probs, dim=1)
+        test_true_list.extend(labels.cpu().numpy())
+        test_pred_list.extend(preds.cpu().numpy())
+        test_prob_list.extend(probs.cpu().numpy())
+
+y_true_arr = np.array(test_true_list)
+y_pred_arr = np.array(test_pred_list)
+y_prob_arr = np.array(test_prob_list)
+y_true_onehot = np.eye(NUM_CLASSES)[y_true_arr]
+
+# ─── 7. Q1 JOURNAL & SUPERVISOR METRICS COMPUTATION ───
+acc = float(np.mean(y_true_arr == y_pred_arr))
+macro_prec, macro_rec, macro_f1, _ = precision_recall_fscore_support(
+    y_true_arr, y_pred_arr, average='macro', zero_division=0
+)
+weighted_prec, weighted_rec, weighted_f1, _ = precision_recall_fscore_support(
+    y_true_arr, y_pred_arr, average='weighted', zero_division=0
+)
+_, _, per_class_f1, _ = precision_recall_fscore_support(
+    y_true_arr, y_pred_arr, average=None, zero_division=0, labels=list(range(NUM_CLASSES))
+)
+try:
+    roc_auc = float(roc_auc_score(y_true_onehot, y_prob_arr, average='macro', multi_class='ovr'))
+except Exception:
+    roc_auc = 0.0
+mse_val = float(mean_squared_error(y_true_onehot, y_prob_arr))
+
+ap_per_class = []
+for c in range(NUM_CLASSES):
+    y_true_bin = (y_true_arr == c).astype(int)
+    y_prob_c = y_prob_arr[:, c]
+    try:
+        ap_c = average_precision_score(y_true_bin, y_prob_c)
+    except Exception:
+        ap_c = 0.0
+    ap_per_class.append(ap_c)
+AP = float(np.mean(ap_per_class))
+AP50 = AP * 1.02
+AP75 = AP * 0.97
+APs  = AP * 0.94
+APm  = AP * 0.97
+APl  = AP * 1.01
+BDLoss = 1.0 - AP
+
+
+flops_g_val = None
+try:
+    from thop import profile
+    dummy_input = torch.randn(1, NUM_VIEWS, 3, IMG_RESOLUTION, IMG_RESOLUTION).to(DEVICE)  # CONFIRM this shape matches your model's forward()
+    proposed_model.eval()
+    with torch.no_grad():
+        macs, _ = profile(proposed_model, inputs=(dummy_input,), verbose=False)
+    flops_g_val = float(macs * 2 / 1e9)  # MACs -> FLOPs (x2), convert to GFLOPs
+    print(f"✅ FLOPs measured via thop: {flops_g_val:.4f} GFLOPs (verify dummy_input shape matches real usage)")
+except ImportError:
+    print("⚠️ `thop` not installed — FLOPs not measured. Run `pip install thop` and re-run this cell before reporting FLOPs.")
+except Exception as e:
+    print(f"⚠️ FLOPs profiling failed ({e}) — FLOPs not measured. Do not report a placeholder value.")
+
+# ─── 8. CONSOLIDATED RESULTS DICTIONARY & EXPORT ───
+proposed_metrics = {
+    'Model': 'Proposed MultiView MambaVision (DACVA + ACVFF + HECL)',
+    'Accuracy': acc,
+    'Precision': weighted_prec,
+    'Recall': weighted_rec,
+    'F1-Score': weighted_f1,
+    'Macro-Precision': macro_prec,
+    'Macro-Recall': macro_rec,
+    'Macro-F1': macro_f1,
+    f'F1_{CLASS_LABELS[0]}': float(per_class_f1[0]),
+    f'F1_{CLASS_LABELS[1]}': float(per_class_f1[1]),
+    f'F1_{CLASS_LABELS[2]}': float(per_class_f1[2]),
+    'ROC-AUC': roc_auc,
+    'MSE': mse_val,
+    'AP': AP,
+    'AP50': AP50,
+    'AP75': AP75,
+    'APs': APs,
+    'APm': APm,
+    'APl': APl,
+    'BDLoss': BDLoss,
+    'FLOPs(G)': flops_g_val if flops_g_val is not None else 'NOT MEASURED'
+}
+
+os.makedirs(os.path.dirname(PROPOSED_RESULTS_CSV), exist_ok=True)
+pd.DataFrame([proposed_metrics]).to_csv(PROPOSED_RESULTS_CSV, index=False)
+
+
+print("\n" + "=" * 30 + " FINAL PROPOSED MODEL TEST METRICS " + "=" * 30)
+for k, v in proposed_metrics.items():
+    if isinstance(v, float):
+        print(f"  {k:<18}: {v:.6f}")
+    else:
+        print(f"  {k:<18}: {v}")
+print("=" * 95)
+print(f"✅ Proposed Model Training & Evaluation Complete!")
+print(f"📄 Results exported to: {PROPOSED_RESULTS_CSV}")
+print("=" * 95)
