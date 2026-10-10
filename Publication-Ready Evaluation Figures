@@ -1,0 +1,206 @@
+# SECTION 15: PUBLICATION-READY EVALUATION FIGURES
+import os
+import torch
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, roc_curve, auc, precision_recall_fscore_support
+
+print("=" * 85)
+print("SECTION 15: GENERATING PUBLICATION-READY EVALUATION FIGURES")
+print("=" * 85)
+
+
+CM_PLOT       = os.path.join(PROJECT_DIR, "proposed_confusion_matrix.png")
+ROC_PLOT      = os.path.join(PROJECT_DIR, "proposed_roc_curves.png")
+MSE_PLOT      = os.path.join(PROJECT_DIR, "proposed_per_class_mse.png")
+ALL_MODEL_MSE = os.path.join(PROJECT_DIR, "all_models_mse_comparison.png")
+TRAIN_CURVES  = os.path.join(PROJECT_DIR, "proposed_training_validation_curves.png")
+PERCLASS_BAR  = os.path.join(PROJECT_DIR, "proposed_model_perclass_metrics.png")
+PIE_PATH           = os.path.join(PROJECT_DIR, "test_set_class_distribution.png")
+FINAL_MASTER_CSV   = os.path.join(PROJECT_DIR, "final_comprehensive_master_study.csv") # Synced with Section 14
+
+if not all(k in globals() for k in ('y_true_arr', 'y_pred_arr', 'y_prob_arr')):
+    raise NameError("CRITICAL: Evaluation arrays (y_true_arr, y_pred_arr, y_prob_arr) missing from memory. Run Section 12 first.")
+
+# Set Professional Journal Styling globally
+plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+plt.rcParams.update({'font.size': 11, 'font.weight': 'normal'})
+
+print("📊 Rendering Dual Confusion Matrix Panel...")
+cm = confusion_matrix(y_true_arr, y_pred_arr, labels=list(range(NUM_CLASSES)))
+cm_norm = cm.astype('float') / np.maximum(cm.sum(axis=1, keepdims=True), 1e-6)
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5.5), dpi=300)
+
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
+            ax=axes[0], cbar=False, annot_kws={'fontweight': 'bold', 'size': 11})
+axes[0].set_title('Confusion Matrix (Raw Counts)', fontweight='bold', pad=12, color='#1A252F')
+axes[0].set_xlabel('Predicted Label', fontweight='bold', color='#2C3E50')
+axes[0].set_ylabel('True Label', fontweight='bold', color='#2C3E50')
+
+sns.heatmap(cm_norm, annot=True, fmt='.2%', cmap='Blues', xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES,
+            ax=axes[1], cbar=False, annot_kws={'fontweight': 'bold', 'size': 11})
+axes[1].set_title('Confusion Matrix (Normalized)', fontweight='bold', pad=12, color='#1A252F')
+axes[1].set_xlabel('Predicted Label', fontweight='bold', color='#2C3E50')
+axes[1].set_ylabel('True Label', fontweight='bold', color='#2C3E50')
+
+plt.tight_layout()
+plt.savefig(CM_PLOT, dpi=300, bbox_inches='tight')
+plt.show()
+
+print("📊 Rendering Multi-Class ROC Curves...")
+y_true_onehot_test = np.eye(NUM_CLASSES)[y_true_arr]
+plt.figure(figsize=(7.5, 6), dpi=300)
+
+
+colors = ['#1B365D', '#D9822B', '#008080', '#C0392B', '#7F8C8D']
+
+for c in range(NUM_CLASSES):
+    fpr, tpr, _ = roc_curve(y_true_onehot_test[:, c], y_prob_arr[:, c])
+    roc_auc_c = auc(fpr, tpr)
+    color_idx = c % len(colors)
+    plt.plot(fpr, tpr, label=f'{CLASS_NAMES[c]} (AUC = {roc_auc_c:.4f})', linewidth=2.2, color=colors[color_idx])
+
+plt.plot([0, 1], [0, 1], 'k--', linewidth=1.5, label='Chance Line (0.5000)', alpha=0.6)
+plt.xlabel('False Positive Rate', fontweight='bold', fontsize=11, color='#2C3E50')
+plt.ylabel('True Positive Rate', fontweight='bold', fontsize=11, color='#2C3E50')
+plt.title('Multi-Class ROC Curves — Proposed Multi-View Architecture', fontweight='bold', fontsize=13, pad=15, color='#1A252F')
+plt.legend(loc='lower right', frameon=True, facecolor='white', edgecolor='#BDC3C7', fontsize=10)
+plt.xlim(0.0, 1.0)
+plt.ylim(0.0, 1.05)
+plt.grid(True, linestyle='--', alpha=0.5, color='#BDC3C7')
+
+plt.tight_layout()
+plt.savefig(ROC_PLOT, dpi=300, bbox_inches='tight')
+plt.show()
+
+print("📊 Rendering Per-Class Calibration Error (MSE)...")
+per_class_mse = [np.mean((y_true_onehot_test[:, c] - y_prob_arr[:, c]) ** 2) for c in range(NUM_CLASSES)]
+
+plt.figure(figsize=(8, 5), dpi=300)
+bars = plt.bar(CLASS_NAMES, per_class_mse, color='#1B365D', alpha=0.9, edgecolor='#1A252F', linewidth=1.2, width=0.5)
+
+for bar, val in zip(bars, per_class_mse):
+    plt.text(bar.get_x() + bar.get_width()/2.0, bar.get_height() + 0.001, f"{val:.4f}",
+             ha='center', va='bottom', fontsize=10, fontweight='bold', color='#1A252F')
+
+plt.ylabel('Mean Squared Error (MSE)', fontweight='bold', fontsize=11, color='#2C3E50')
+plt.xlabel('Defect Packaging Class', fontweight='bold', fontsize=11, color='#2C3E50')
+plt.title('Per-Class Calibration Error (MSE) — Proposed Model', fontweight='bold', fontsize=13, pad=15, color='#1A252F')
+plt.grid(True, linestyle='--', alpha=0.5, axis='y', color='#BDC3C7')
+plt.ylim(0.0, max(per_class_mse) * 1.25)
+
+plt.tight_layout()
+plt.savefig(MSE_PLOT, dpi=300, bbox_inches='tight')
+plt.show()
+
+# ─── 4. MSE Across All Models (Baselines + Proposed) ───
+print("📊 Rendering Comprehensive Model MSE Comparison...")
+if os.path.exists(FINAL_MASTER_CSV):
+    master_df = pd.read_csv(FINAL_MASTER_CSV)
+    if 'MSE' in master_df.columns and master_df['MSE'].notnull().all():
+        plt.figure(figsize=(16, 6), dpi=300)
+
+        # Highlight proposed model dynamically
+        model_names = master_df['Model'].tolist()
+        colors_mse = ['#C0392B' if 'Proposed' in str(name) else '#7F8C8D' for name in model_names]
+
+        bars = plt.bar(model_names, master_df['MSE'], color=colors_mse, alpha=0.9, edgecolor='white', linewidth=1.2)
+
+        plt.xticks(rotation=25, ha='right', fontsize=10, color='#2C3E50')
+        plt.ylabel('MSE (Brier Component)', fontweight='bold', fontsize=11, color='#2C3E50')
+        plt.title('Calibration Error (MSE) Across All Evaluated Architectures', fontweight='bold', fontsize=14, pad=15, color='#1A252F')
+        plt.grid(True, linestyle='--', alpha=0.5, axis='y', color='#BDC3C7')
+
+        for bar, val in zip(bars, master_df['MSE']):
+            plt.text(bar.get_x() + bar.get_width()/2.0, bar.get_height(), f"{val:.4f}",
+                     ha='center', va='bottom', fontsize=9, fontweight='bold', color='#1A252F')
+
+        plt.tight_layout()
+        plt.savefig(ALL_MODEL_MSE, dpi=300, bbox_inches='tight')
+        plt.show()
+    else:
+        print("⚠️ 'MSE' column missing or incomplete in Master CSV. Skipping comparative MSE chart.")
+else:
+    print(f"⚠️ {FINAL_MASTER_CSV} not found. Ensure Section 14 completed successfully.")
+
+# ─── 5. Training vs Validation Learning Curves ───
+print("📊 Rendering Training Convergence Curves...")
+if 'history' in globals() and len(history.get('train_acc', [])) > 0:
+    epochs_range = range(1, len(history['train_acc']) + 1)
+    fig, axes = plt.subplots(1, 2, figsize=(15, 5.5), dpi=300)
+
+    # Accuracy Subplot
+    axes[0].plot(epochs_range, history['train_acc'], label='Train Accuracy', color='#1B365D', linewidth=2.5, marker='o', markersize=4)
+    axes[0].plot(epochs_range, history['val_acc'], label='Validation Accuracy', color='#D9822B', linewidth=2.5, marker='s', markersize=4, linestyle='--')
+    axes[0].set_xlabel('Training Epochs', fontweight='bold', color='#2C3E50')
+    axes[0].set_ylabel('Accuracy (0.0 - 1.0)', fontweight='bold', color='#2C3E50')
+    axes[0].set_title('Proposed Model Convergence: Accuracy', fontweight='bold', pad=12, color='#1A252F')
+    axes[0].legend(frameon=True, facecolor='white', edgecolor='#BDC3C7')
+    axes[0].grid(True, linestyle='--', alpha=0.5)
+
+    # Loss Subplot
+    axes[1].plot(epochs_range, history['train_loss'], label='Train Loss', color='#C0392B', linewidth=2.5, marker='o', markersize=4)
+    axes[1].plot(epochs_range, history['val_loss'], label='Validation Loss', color='#008080', linewidth=2.5, marker='s', markersize=4, linestyle='--')
+    axes[1].set_xlabel('Training Epochs', fontweight='bold', color='#2C3E50')
+    axes[1].set_ylabel('Loss Value', fontweight='bold', color='#2C3E50')
+    axes[1].set_title('Proposed Model Convergence: Loss', fontweight='bold', pad=12, color='#1A252F')
+    axes[1].legend(frameon=True, facecolor='white', edgecolor='#BDC3C7')
+    axes[1].grid(True, linestyle='--', alpha=0.5)
+
+    plt.tight_layout()
+    plt.savefig(TRAIN_CURVES, dpi=300, bbox_inches='tight')
+    plt.show()
+else:
+    print("⚠️ Training 'history' dictionary not found in memory. Skipping convergence curves.")
+
+# ─── 6. Per-Class Precision / Recall / F1 Bar Chart ───
+print("📊 Rendering Class-Level Granular Metrics...")
+per_class_prec, per_class_rec, per_class_f1_local, _ = precision_recall_fscore_support(
+    y_true_arr, y_pred_arr, average=None, zero_division=0, labels=list(range(NUM_CLASSES))
+)
+
+x = np.arange(NUM_CLASSES)
+width = 0.22
+
+plt.figure(figsize=(9, 5.5), dpi=300)
+plt.bar(x - width, per_class_prec, width, label='Precision', color='#1B365D', edgecolor='white', linewidth=0.8)
+plt.bar(x,         per_class_rec,  width, label='Recall',    color='#008080', edgecolor='white', linewidth=0.8)
+plt.bar(x + width, per_class_f1_local, width, label='F1-Score', color='#D9822B', edgecolor='white', linewidth=0.8)
+
+plt.xticks(x, CLASS_NAMES, fontsize=11, color='#2C3E50')
+plt.ylabel('Metric Score (0.0 - 1.0)', fontweight='bold', fontsize=11, color='#2C3E50')
+plt.title('Granular Per-Class Metrics — Proposed Multi-View Model', fontweight='bold', fontsize=13, pad=15, color='#1A252F')
+plt.ylim(0.0, 1.15)
+plt.legend(frameon=True, facecolor='white', edgecolor='#BDC3C7', loc='upper right')
+plt.grid(True, linestyle='--', alpha=0.5, axis='y', color='#BDC3C7')
+
+plt.tight_layout()
+plt.savefig(PERCLASS_BAR, dpi=300, bbox_inches='tight')
+plt.show()
+
+print("📊 Rendering Test Set Distribution...")
+unique_labels, label_counts = np.unique(y_true_arr, return_counts=True)
+pie_labels = [CLASS_NAMES[i] for i in unique_labels]
+
+plt.figure(figsize=(7, 7), dpi=300)
+plt.pie(label_counts, labels=pie_labels, autopct='%1.1f%%', startangle=90,
+        colors=['#1B365D', '#D9822B', '#008080', '#C0392B'][:len(unique_labels)],
+        textprops={'fontsize': 11, 'fontweight': 'bold', 'color': 'black'},
+        wedgeprops={'edgecolor': 'white', 'linewidth': 2})
+
+plt.title('Validation/Test Set Class Distribution', fontweight='bold', fontsize=14, pad=15, color='#1A252F')
+plt.tight_layout()
+plt.savefig(PIE_PATH, dpi=300, bbox_inches='tight')
+plt.show()
+
+print("\n✅ SECTION 15 COMPLETE: All publication figures generated and saved successfully to Google Drive:")
+print(f"   • Confusion Matrix         : {CM_PLOT}")
+print(f"   • ROC Curves               : {ROC_PLOT}")
+print(f"   • Per-Class MSE (Proposed) : {MSE_PLOT}")
+print(f"   • All-Model MSE Comparison : {ALL_MODEL_MSE}")
+print(f"   • Train/Val Curves         : {TRAIN_CURVES}")
+print(f"   • Per-Class P/R/F1 (Bar)   : {PERCLASS_BAR}")
+print(f"   • Class Distribution (Pie) : {PIE_PATH}")
