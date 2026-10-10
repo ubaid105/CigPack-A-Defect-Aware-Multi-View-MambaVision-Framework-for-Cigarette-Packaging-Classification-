@@ -1,0 +1,69 @@
+# SECTION 13: MODEL EXPLAINABILITY & STRESS TESTING (GRAD-CAM & VIEW DROPOUT)
+import os
+import cv2
+import torch
+import torch.nn.functional as F
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from tqdm.notebook import tqdm
+
+print("=" * 85)
+print("SECTION 13: EXECUTING MULTI-VIEW GRAD-CAM & CAMERA OCCLUSION STRESS TEST")
+print("=" * 85)
+
+STRESS_PLOT  = os.path.join(PROJECT_DIR, "multiview_camera_stress_test.png")
+GRADCAM_PLOT = os.path.join(PROJECT_DIR, "multiview_gradcam_heatmaps.png")
+
+if 'proposed_model' not in globals():
+    raise NameError("CRITICAL: 'proposed_model' not found in memory. Please ensure Section 12 completed successfully.")
+
+proposed_model.eval()
+mean_norm = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+std_norm  = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+black_tensor = torch.tensor(((0.0 - mean_norm) / std_norm).astype(np.float32)).to(DEVICE)
+
+# PART 1: HARDWARE FAILURE SIMULATION (VIEW-REMOVAL STRESS TEST)
+print(f"🔬 Part 1: Running View-Removal Stress Testing across {NUM_VIEWS} camera angles...")
+occlusion_impact = {view: 0.0 for view in VIEW_NAMES}
+total_test_batches = len(test_loader)
+
+with torch.no_grad():
+    for inputs, labels in tqdm(test_loader, desc="Simulating Camera Failures"):
+        inputs, labels = inputs.to(DEVICE), labels.to(DEVICE)
+
+        base_out = proposed_model(inputs)
+        base_preds = torch.argmax(base_out['logits'] if isinstance(base_out, dict) else base_out, dim=1)
+        base_correct = (base_preds == labels).float()
+        for v_idx in range(NUM_VIEWS):
+            inputs_occluded = inputs.clone()
+            inputs_occluded[:, v_idx, :, :, :] = black_tensor.view(1, 3, 1, 1)
+
+            occ_out = proposed_model(inputs_occluded)
+            occ_preds = torch.argmax(occ_out['logits'] if isinstance(occ_out, dict) else occ_out, dim=1)
+            occ_correct = (occ_preds == labels).float()
+
+            acc_drop = (base_correct - occ_correct).mean().item()
+            occlusion_impact[VIEW_NAMES[v_idx]] += acc_drop
+
+print("\n📊 Camera Sensitivity Occlusion Impact Summary:")
+for view in occlusion_impact:
+    occlusion_impact[view] = (occlusion_impact[view] / total_test_batches) * 100.0
+    print(f"   • Dropping [{view:<6}] Camera -> Validation Accuracy Impact: {occlusion_impact[view]:+.2f}%")
+
+plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+plt.figure(figsize=(9, 5), dpi=300)
+bars = plt.bar(occlusion_impact.keys(), occlusion_impact.values(), color='#C0392B', alpha=0.9, edgecolor='#2C3E50', linewidth=1.2)
+
+plt.ylabel('Accuracy Drop Percentage (%)', fontweight='bold', fontsize=11, color='#2C3E50')
+plt.xlabel('Occluded Camera Angle', fontweight='bold', fontsize=11, color='#2C3E50')
+plt.title('Multi-View Architecture Robustness to Isolated Camera Failure', fontweight='bold', fontsize=13, pad=15, color='#1A252F')
+plt.grid(True, linestyle='--', alpha=0.6)
+
+for bar in bars:
+    yval = bar.get_height()
+    plt.text(bar.get_x() + bar.get_width()/2.0, yval + 0.15, f"{yval:.2f}%", ha='center', va='bottom', fontsize=10, fontweight='bold', color='#1A252F')
+
+plt.tight_layout()
+plt.savefig(STRESS_PLOT, dpi=300, bbox_inches='tight')
+plt.show()
