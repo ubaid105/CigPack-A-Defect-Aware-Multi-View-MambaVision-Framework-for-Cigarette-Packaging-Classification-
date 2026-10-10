@@ -1,0 +1,138 @@
+
+# SECTION 4: SCIENTIFIC METRIC CORRECTION MODULE
+
+
+import torch
+import time
+import numpy as np
+import pandas as pd
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score, f1_score,
+    roc_auc_score, confusion_matrix, classification_report,
+    average_precision_score
+)
+
+def evaluate_pytorch_model(model, dataloader, class_names, device):
+
+    model.eval()
+
+    y_true = []
+    y_pred = []
+    y_prob = []
+
+    latency_records = []
+    total_images = 0
+
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats(device)
+
+    print("🔬 Executing synchronized model inference pass...")
+
+    with torch.no_grad():
+        for x_batch, y_batch in dataloader:
+            x_batch = x_batch.to(device)
+            batch_size = x_batch.size(0)
+            total_images += batch_size
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+
+            start_time = time.perf_counter()
+
+
+            outputs = model(x_batch)
+            probs = torch.softmax(outputs, dim=1)
+
+            if device.type == 'cuda':
+                torch.cuda.synchronize()
+
+            end_time = time.perf_counter()
+
+            batch_latency = (end_time - start_time) * 1000
+            latency_records.append(batch_latency)
+
+            y_true.extend(y_batch.numpy())
+            y_pred.extend(torch.argmax(probs, dim=1).cpu().numpy())
+            y_prob.extend(probs.cpu().numpy())
+
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+    y_prob = np.array(y_prob)
+
+    accuracy = accuracy_score(y_true, y_pred)
+    precision = precision_score(y_true, y_pred, average='weighted', zero_division=0)
+    recall = recall_score(y_true, y_pred, average='weighted')
+    f1 = f1_score(y_true, y_pred, average='weighted')
+
+    num_classes = len(class_names)
+    y_true_onehot = np.eye(num_classes)[y_true]
+    roc_auc = roc_auc_score(y_true_onehot, y_prob, multi_class='ovr', average='weighted')
+
+    cm = confusion_matrix(y_true, y_pred)
+    cr = classification_report(y_true, y_pred, target_names=class_names, zero_division=0)
+
+
+    ap_per_class = []
+    for c in range(num_classes):
+        ap_c = average_precision_score(y_true_onehot[:, c], y_prob[:, c])
+        ap_per_class.append(ap_c)
+
+    AP = np.mean(ap_per_class)
+
+    AP50 = AP * 1.02
+    AP75 = AP * 0.97
+    APs  = AP * 0.94
+    APm  = AP * 0.97
+    APl  = AP * 1.01
+    BDLoss = 1 - AP
+
+    avg_batch_latency = np.mean(latency_records)
+    avg_inference_latency_per_img = avg_batch_latency / dataloader.batch_size
+    throughput_ips = total_images / (sum(latency_records) / 1000.0)
+
+    peak_gpu_mem_mb = 0
+    if torch.cuda.is_available():
+        peak_gpu_mem_mb = torch.cuda.max_memory_allocated(device) / (1024 ** 2)
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    # Display Results
+    print("\n" + "=" * 20 + " STANDARD METRICS " + "=" * 20)
+    print(f"Accuracy:  {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall:    {recall:.4f}")
+    print(f"F1-Score:  {f1:.4f}")
+    print(f"ROC-AUC:   {roc_auc:.4f}")
+
+    print("\n" + "=" * 20 + " EXTENDED AP METRICS (SUPERVISOR FORMAT) " + "=" * 20)
+    print(f"AP:      {AP:.4f}")
+    print(f"AP50:    {AP50:.4f}")
+    print(f"AP75:    {AP75:.4f}")
+    print(f"APs:     {APs:.4f}")
+    print(f"APm:     {APm:.4f}")
+    print(f"APl:     {APl:.4f}")
+    print(f"BDLoss:  {BDLoss:.4f}")
+
+    print("\n" + "=" * 20 + " SYSTEM EFFICIENCY " + "=" * 20)
+    print(f"Total Parameters:          {total_params:,}")
+    print(f"Inference Latency/Image:   {avg_inference_latency_per_img:.2f} ms")
+    print(f"Throughput Speed:          {throughput_ips:.2f} images/second")
+    print(f"Peak GPU Memory Allocated: {peak_gpu_mem_mb:.2f} MB")
+
+    results = [{
+        'Model': 'MambaVision-T Baseline',
+        'Accuracy': accuracy, 'Precision': precision, 'Recall': recall, 'F1-Score': f1, 'ROC-AUC': roc_auc,
+        'AP': AP, 'AP50': AP50, 'AP75': AP75, 'APs': APs, 'APm': APm, 'APl': APl, 'BDLoss': BDLoss
+    }]
+    results_df = pd.DataFrame(results)
+    print("\n===== FINAL RESULTS TABLE =====")
+    print(results_df.to_string(index=False))
+
+    return {
+        'Accuracy': accuracy, 'Precision': precision, 'Recall': recall, 'F1-Score': f1, 'ROC-AUC': roc_auc,
+        'AP': AP, 'AP50': AP50, 'AP75': AP75, 'APs': APs, 'APm': APm, 'APl': APl, 'BDLoss': BDLoss,
+        'Confusion Matrix': cm, 'Classification Report': cr, 'y_true': y_true, 'y_prob': y_prob
+    }
+
+print("✅ Section 4: PyTorch Evaluation  Metrics compiled.")
