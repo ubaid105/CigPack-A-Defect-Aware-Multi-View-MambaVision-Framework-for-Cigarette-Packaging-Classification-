@@ -1,0 +1,112 @@
+# SECTION 14: GENERATING FINAL MASTER STUDY & COMPARATIVE GRAPHICS
+import os
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+print("=" * 85)
+print("SECTION 14: GENERATING FINAL COMPREHENSIVE STUDY & COMPARATIVE GRAPHICS")
+print("=" * 85)
+
+
+BASELINE_CSV     = os.path.join(PROJECT_DIR, "master_model_baseline_results.csv")
+PROPOSED_CSV     = os.path.join(PROJECT_DIR, "proposed_mambavision_results.csv")
+FINAL_MASTER_CSV = os.path.join(PROJECT_DIR, "final_comprehensive_master_study.csv")
+FINAL_PLOT       = os.path.join(PROJECT_DIR, "final_comprehensive_comparison_bar.png")
+
+PROPOSED_MODEL_LABEL = globals().get('PROPOSED_MODEL_LABEL', 'Proposed: MambaVision + DACVA + ACVFF + HECL')
+
+if os.path.exists(BASELINE_CSV):
+    base_df = pd.read_csv(BASELINE_CSV)
+    print(f"✅ Successfully loaded {len(base_df)} baseline models from Master Matrix.")
+else:
+    raise FileNotFoundError(f"❌ CRITICAL: Missing baseline master matrix at {BASELINE_CSV}")
+
+if os.path.exists(PROPOSED_CSV):
+    proposed_df = pd.read_csv(PROPOSED_CSV)
+    print(f"✅ Successfully loaded proposed model results.")
+else:
+    raise FileNotFoundError(f"❌ CRITICAL: Missing proposed results at {PROPOSED_CSV}")
+
+# Standardize the Proposed Model Name for the Matrix
+proposed_df['Model'] = PROPOSED_MODEL_LABEL
+
+# 3. Schema Alignment & Validation
+base_cols = set(base_df.columns)
+proposed_cols = set(proposed_df.columns)
+baseline_only = base_cols - proposed_cols
+proposed_only = proposed_cols - base_cols
+
+if baseline_only or proposed_only:
+    print("⚠️ Notice: Column schema mismatch detected between baseline and proposed results:")
+    if baseline_only:
+        print(f"   • Missing in Proposed (will fill with NaN): {sorted(baseline_only)}")
+    if proposed_only:
+        print(f"   • Missing in Baselines (will fill with NaN): {sorted(proposed_only)}")
+else:
+    print("✅ Column schemas align perfectly. Safe to merge.")
+
+# 4. Merge and Deduplicate
+final_master_df = pd.concat([base_df, proposed_df], ignore_index=True)
+final_master_df.drop_duplicates(subset=['Model'], keep='last', inplace=True)
+total_models = len(final_master_df)
+
+os.makedirs(os.path.dirname(FINAL_MASTER_CSV), exist_ok=True)
+final_master_df.to_csv(FINAL_MASTER_CSV, index=False)
+
+print(f"\n" + "=" * 25 + f" FINAL {total_models}-MODEL RESEARCH STUDY " + "=" * 25)
+
+def format_metric(value):
+    if pd.isnull(value):
+        return "N/A"
+    try:
+        return f"{float(value):.6f}"
+    except (ValueError, TypeError):
+        return str(value)
+
+formatters = {col: format_metric for col in final_master_df.columns}
+print(final_master_df.to_string(index=False, formatters=formatters))
+print("=" * 85)
+
+plot_metrics = ['Accuracy', 'F1-Score', 'AP50', 'AP75']
+
+missing_report = final_master_df.set_index('Model')[plot_metrics].isnull()
+if missing_report.values.any():
+    print("⚠️ Missing values detected in core plot metrics. Some bars will not render.")
+
+plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+fig, ax = plt.subplots(figsize=(18, 8), dpi=300)
+
+models_list = final_master_df['Model'].tolist()
+x = np.arange(len(models_list))
+width = 0.18
+
+ax.bar(x - width*1.5, final_master_df['Accuracy'], width, label='Accuracy', color='#1B365D', edgecolor='white', linewidth=0.8)
+ax.bar(x - width/2,   final_master_df['F1-Score'], width, label='F1-Score', color='#008080', edgecolor='white', linewidth=0.8)
+ax.bar(x + width/2,   final_master_df['AP50'],     width, label='AP50',     color='#D9822B', edgecolor='white', linewidth=0.8)
+ax.bar(x + width*1.5, final_master_df['AP75'],     width, label='AP75',     color='#C0392B', edgecolor='white', linewidth=0.8)
+
+
+ax.set_ylabel('Performance Metrics (0.0 - 1.0)', fontsize=12, fontweight='bold', labelpad=12, color='#2C3E50')
+ax.set_title(f'Comprehensive Benchmark: {total_models-1} Single-View Baselines vs. Proposed Multi-View Architecture',
+             fontsize=15, fontweight='bold', pad=18, color='#1A252F')
+
+ax.set_xticks(x)
+xtick_labels = ax.set_xticklabels(models_list, rotation=25, ha='right', fontsize=10, color='#2C3E50')
+
+for idx, label in enumerate(xtick_labels):
+    if PROPOSED_MODEL_LABEL in label.get_text():
+        label.set_fontweight('bold')
+        label.set_color('#C0392B')
+
+ax.set_ylim(0.0, 1.15)
+ax.legend(loc='upper left', bbox_to_anchor=(1.01, 1), frameon=True, facecolor='white', edgecolor='#BDC3C7', fontsize=11)
+ax.grid(True, linestyle='--', alpha=0.5, color='#BDC3C7')
+
+plt.tight_layout()
+plt.savefig(FINAL_PLOT, dpi=300, bbox_inches='tight')
+plt.show()
+
+print(f"\n🎉 ALL EXPERIMENTAL STAGES SUCCESSFULLY COMPLETED!")
+print(f"   📄 Complete Master Study CSV : {FINAL_MASTER_CSV}")
+print(f"   🖼️ Publication Bar Graphic   : {FINAL_PLOT}")
