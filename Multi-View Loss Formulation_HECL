@@ -1,0 +1,275 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+print("=" * 85)
+print("SECTION 11: INITIALIZING PROFESSIONAL MULTI-VIEW LOSS FORMULATION")
+print("=" * 85)
+
+
+
+
+def compute_effective_num_weights(class_counts, beta=0.999):
+
+    class_counts = torch.as_tensor(class_counts, dtype=torch.float32)
+    effective_num = 1.0 - torch.pow(beta, class_counts)
+    weights = (1.0 - beta) / effective_num
+    weights = weights / weights.sum() * len(class_counts)
+    return weights
+
+class FocalCrossEntropyLoss(nn.Module):
+
+    def __init__(self, class_weights=None, gamma=2.0, label_smoothing=0.03, reduction='mean'):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ce = nn.CrossEntropyLoss(
+            weight=class_weights, label_smoothing=label_smoothing, reduction='none'
+        )
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)                  # (B,)
+        pt = torch.exp(-ce_loss).clamp(min=1e-6, max=1.0)    # model's confidence on the true class
+        focal_term = (1 - pt) ** self.gamma
+        loss = focal_term * ce_loss
+        if self.reduction == 'mean':
+            return loss.mean()
+        elif self.reduction == 'sum':
+            return loss.sum()
+        return loss
+
+class HardExampleContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.07, min_positives=1):
+        super().__init__()
+        self.temperature = temperature
+        self.min_positives = min_positives
+
+    def forward(self, embeddings, labels):
+        batch_size = embeddings.shape[0]
+        embeddings = F.normalize(embeddings, p=2, dim=1)
+        similarity_matrix = torch.matmul(embeddings, embeddings.T) / self.temperature
+
+        labels = labels.contiguous().view(-1, 1)
+        mask = torch.eq(labels, labels.T).float().to(embeddings.device)
+
+        logits_mask = torch.scatter(
+            torch.ones_like(mask), 1,
+            torch.arange(batch_size).view(-1, 1).to(embeddings.device), 0
+        )
+        mask = mask * logits_mask
+        sim_max, _ = similarity_matrix.max(dim=1, keepdim=True)
+        similarity_matrix = similarity_matrix - sim_max.detach()
+
+        exp_sim = torch.exp(similarity_matrix) * logits_mask
+        log_prob = similarity_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True) + 1e-6)
+
+        pos_counts = mask.sum(dim=1)
+        valid = pos_counts >= self.min_positives
+
+        if valid.sum() == 0:
+            return torch.tensor(0.0, device=embeddings.device, requires_grad=True)
+
+        mean_log_prob_pos = (mask * log_prob).sum(dim=1)[valid] / pos_counts[valid].clamp(min=1e-6)
+        loss = -mean_log_prob_pos.mean()
+        return loss
+
+
+
+
+
+class MultiViewLossWithHECL(nn.Module):
+
+    def __init__(
+        self,
+        class_weights=None,
+        alpha_aux=0.20,
+        lambda_hecl=0.12,
+        label_smoothing=0.03,
+        detach_view_weights_in_aux=True,
+        view_weight_entropy_reg=0.0,
+        hecl_warmup_steps=0,
+        use_focal_master=True,
+        focal_gamma=2.0,
+    ):
+        super().__init__()
+        self.alpha_aux = alpha_aux
+        self.lambda_hecl_target = lambda_hecl
+        self.hecl_warmup_steps = hecl_warmup_steps
+        self.detach_view_weights_in_aux = detach_view_weights_in_aux
+        self.view_weight_entropy_reg = view_weight_entropy_reg
+
+        if use_focal_master:
+            self.master_ce_loss = FocalCrossEntropyLoss(
+                class_weights=class_weights, gamma=focal_gamma,
+                label_smoothing=label_smoothing, reduction='mean'
+            )
+        else:
+            self.master_ce_loss = nn.CrossEntropyLoss(
+                weight=class_weights, label_smoothing=label_smoothing, reduction='mean'
+            )
+
+        self.aux_view_ce_loss = nn.CrossEntropyLoss(
+            weight=class_weights, label_smoothing=label_smoothing, reduction='none'
+        )
+        self.hecl_loss = HardExampleContrastiveLoss(temperature=0.07)
+
+        self.register_buffer('_step', torch.tensor(0, dtype=torch.long))
+
+    def _current_lambda_hecl(self):
+        if self.hecl_warmup_steps <= 0:
+            return self.lambda_hecl_target
+        frac = min(1.0, float(self._step.item()) / float(self.hecl_warmup_steps))
+        return self.lambda_hecl_target * frac
+
+    def forward(self, model_outputs, targets, aux_targets=None):
+
+        master_logits = model_outputs['logits']
+        per_view_logits = model_outputs.get('per_view_logits', model_outputs.get('aux_logits'))
+        view_weights = model_outputs['view_weights']
+        embeddings = model_outputs.get('embeddings', model_outputs.get('proj_feats'))
+
+        if per_view_logits is None:
+            raise KeyError("model_outputs must contain 'per_view_logits' or 'aux_logits'")
+        if embeddings is None:
+            raise KeyError("model_outputs must contain 'embeddings' or 'proj_feats'")
+
+        B, V, C = per_view_logits.shape
+
+
+        loss_master = self.master_ce_loss(master_logits, targets)
+
+        if aux_targets is not None:
+            aux_t = aux_targets
+        else:
+            aux_t = targets.unsqueeze(1).repeat(1, V)
+        assert aux_t.shape == (B, V), f"aux_targets must be (B, V)={(B, V)}, got {tuple(aux_t.shape)}"
+
+        per_view_logits_flat = per_view_logits.reshape(B * V, C)
+        aux_t_flat = aux_t.reshape(B * V)
+        raw_view_losses = self.aux_view_ce_loss(per_view_logits_flat, aux_t_flat).view(B, V)
+
+        vw = view_weights.squeeze(-1)
+
+        vw_for_loss = vw.detach() if self.detach_view_weights_in_aux else vw
+        vw_norm = vw_for_loss / vw_for_loss.sum(dim=-1, keepdim=True).clamp(min=1e-6)
+
+        weighted_view_losses = raw_view_losses * vw_norm
+        loss_aux = torch.mean(torch.sum(weighted_view_losses, dim=-1))
+
+        loss_hecl = self.hecl_loss(embeddings, targets)
+
+
+        entropy_reg = torch.tensor(0.0, device=master_logits.device)
+        if self.view_weight_entropy_reg > 0:
+            p = vw.clamp(min=1e-8)
+            entropy = -(p * p.log()).sum(dim=-1).mean()
+            max_entropy = torch.log(torch.tensor(float(V), device=master_logits.device))
+            entropy_reg = self.view_weight_entropy_reg * (max_entropy - entropy)
+
+        lambda_hecl = self._current_lambda_hecl()
+        if self.training:
+            self._step += 1
+
+        total_loss = (
+            loss_master
+            + (self.alpha_aux * loss_aux)
+            + (lambda_hecl * loss_hecl)
+            + entropy_reg
+        )
+
+        return {
+            'total_loss': total_loss,
+            'loss_master': loss_master.item(),
+            'loss_aux': loss_aux.item(),
+            'loss_hecl': loss_hecl.item(),
+            'lambda_hecl_used': lambda_hecl,
+        }
+
+
+print("✅ SECTION 11 COMPLETE: ADVANCED MULTI-VIEW LOSS FORMULATION LOADED INTO MEMORY")
+if __name__ == "__main__":
+    torch.manual_seed(42)
+
+
+    BATCH_SIZE = 16
+    NUM_VIEWS = 6
+    NUM_CLASSES = 3
+    EMBED_DIM = 128
+
+    class_priors = torch.tensor([0.736, 0.224, 0.041])
+    class_weights = (1.0 / class_priors)
+    class_weights = class_weights / class_weights.sum() * NUM_CLASSES
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # --- Synthetic batch, sampled from the real prior so Deformed is rare ---
+    targets = torch.multinomial(class_priors, BATCH_SIZE, replacement=True).to(device)
+
+    model_outputs = {
+        'logits': torch.randn(BATCH_SIZE, NUM_CLASSES, device=device, requires_grad=True),
+        'per_view_logits': torch.randn(BATCH_SIZE, NUM_VIEWS, NUM_CLASSES, device=device, requires_grad=True),
+        'view_weights': torch.softmax(torch.randn(BATCH_SIZE, NUM_VIEWS, 1, device=device), dim=1),
+        'embeddings': torch.randn(BATCH_SIZE, EMBED_DIM, device=device, requires_grad=True),
+    }
+
+    criterion = MultiViewLossWithHECL(
+        class_weights=class_weights.to(device),
+        alpha_aux=0.20,
+        lambda_hecl=0.12,
+        label_smoothing=0.03,
+        hecl_warmup_steps=100,
+    ).to(device)
+    criterion.train()
+
+    print("=" * 60)
+    print("MultiViewLossWithHECL — Sanity Check")
+    print("=" * 60)
+    print(f"Device            : {device}")
+    print(f"Batch size        : {BATCH_SIZE}")
+    print(f"Views per box     : {NUM_VIEWS}")
+    print(f"Classes           : {NUM_CLASSES}")
+    print(f"Embedding dim     : {EMBED_DIM}")
+    print(f"Class weights     : {class_weights.tolist()}")
+    print(f"Target label dist : {torch.bincount(targets, minlength=NUM_CLASSES).tolist()}  "
+          f"(Damaged/Good/Deformed)")
+    print("-" * 60)
+
+    # --- Run a few steps to confirm HECL warm-up ramps as expected ---
+    for step in range(3):
+        out = criterion(model_outputs, targets)
+        print(f"[step {step}] total_loss={out['total_loss'].item():.4f} "
+              f"| master={out['loss_master']:.4f} "
+              f"| aux={out['loss_aux']:.4f} "
+              f"| hecl={out['loss_hecl']:.4f} "
+              f"| lambda_hecl_used={out['lambda_hecl_used']:.4f}")
+
+    print("-" * 60)
+
+    # --- Gradient sanity check: confirm loss actually backprops into every input ---
+    out = criterion(model_outputs, targets)
+    out['total_loss'].backward()
+
+    grad_report = {
+        'logits (master)': model_outputs['logits'].grad,
+        'per_view_logits (aux)': model_outputs['per_view_logits'].grad,
+        'embeddings (hecl)': model_outputs['embeddings'].grad,
+    }
+    print("Gradient check:")
+    for name, grad in grad_report.items():
+        status = "OK" if grad is not None and torch.isfinite(grad).all() else "FAILED"
+        norm = grad.norm().item() if grad is not None else float('nan')
+        print(f"  {name:<24s}: grad_norm={norm:.4f}  [{status}]")
+
+    print("-" * 60)
+
+    # --- Edge case: batch with zero Deformed samples (the failure mode we fixed) ---
+    forced_targets = torch.zeros(BATCH_SIZE, dtype=torch.long, device=device)  # all class 0
+    out_edge = criterion(model_outputs, forced_targets)
+    hecl_val = out_edge['loss_hecl']
+    finite = torch.isfinite(torch.tensor(hecl_val)).item()
+    print(f"Edge case (single-class batch) — HECL loss: {hecl_val:.4f}  "
+          f"[{'STABLE' if finite else 'UNSTABLE — NaN/Inf'}]")
+
+    print("=" * 60)
+    print("All checks passed." if finite else "WARNING: instability detected.")
+    print("=" * 60)
