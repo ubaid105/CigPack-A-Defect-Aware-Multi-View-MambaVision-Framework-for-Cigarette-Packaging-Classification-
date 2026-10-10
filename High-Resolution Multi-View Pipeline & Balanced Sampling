@@ -1,0 +1,132 @@
+
+# SECTION 9 : HIGH-RESOLUTION MULTI-VIEW PIPELINE & BALANCED SAMPLING
+
+
+import torch
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from torchvision.transforms import v2
+from PIL import Image
+import pandas as pd
+import numpy as np
+import os
+
+print("=" * 85)
+print("SECTION 9: CONFIGURING HIGH-RESOLUTION MULTI-VIEW DATALOADERS")
+print("=" * 85)
+
+
+IMG_RESOLUTION = 224
+
+class MultiViewCigaretteDataset(Dataset):
+    def __init__(self, metadata_csv, split='train', num_views=6, transform=None):
+        self.df = pd.read_csv(metadata_csv)
+        self.df['image_path'] = self.df['image_path'].str.replace(
+            '/content/drive/MyDrive/Packing_Project',
+            '/content/drive/MyDrive/Packing_Project_Local',
+            regex=False
+        )
+        self.df = self.df[self.df['split'].str.lower() == split.lower()].reset_index(drop=True)
+        self.num_views = num_views
+        self.transform = transform
+        self.class_to_idx = {name: idx for idx, name in enumerate(CLASS_LABELS)}
+        self.view_order = VIEW_NAMES
+
+        grouped = self.df.groupby('box_id')
+        self.box_ids = list(self.df['box_id'].unique())
+        self.box_to_paths = {}
+        self.box_labels = []
+        for b_id, group in grouped:
+
+            reindexed_group = group.set_index('view_id').reindex(self.view_order).reset_index()
+            paths = reindexed_group['image_path'].tolist()
+
+            label_str = str(reindexed_group['box_label'].dropna().iloc[0]).strip()
+            label_idx = self.class_to_idx.get(label_str)
+            if label_idx is None:
+                raise ValueError(f"Unknown box_label '{label_str}' for box {b_id}")
+
+            self.box_to_paths[b_id] = paths
+            self.box_labels.append(label_idx)
+
+    def __len__(self):
+        return len(self.box_ids)
+
+    def __getitem__(self, idx):
+        b_id = self.box_ids[idx]
+        paths = self.box_to_paths[b_id]
+        label = self.box_labels[idx]
+
+        images = []
+        for img_path in paths:
+            try:
+                img = Image.open(str(img_path).strip()).convert('RGB')
+            except Exception:
+                img = Image.new('RGB', (IMG_RESOLUTION, IMG_RESOLUTION), (0, 0, 0))
+
+            images.append(img)
+
+        # Pad views if missing
+        while len(images) < self.num_views:
+            pad_img = images[-1] if len(images) > 0 else Image.new('RGB', (IMG_RESOLUTION, IMG_RESOLUTION), (0, 0, 0))
+            images.append(pad_img)
+        images = images[:self.num_views]
+
+        # Single transform pass per image view
+        if self.transform:
+            stacked_views = torch.stack([self.transform(im) for im in images], dim=0)
+        else:
+            stacked_views = torch.stack([v2.functional.to_image(im) for im in images], dim=0)
+
+        return stacked_views, torch.tensor(label, dtype=torch.long)
+
+
+multiview_train_transforms = v2.Compose([
+    v2.Resize((IMG_RESOLUTION, IMG_RESOLUTION)),
+    v2.RandomHorizontalFlip(p=0.5),
+    v2.RandomVerticalFlip(p=0.2),
+    v2.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.03),
+    v2.RandomRotation(degrees=10),
+    v2.ToImage(),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.RandomErasing(p=0.05, scale=(0.01, 0.05)),
+    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+multiview_test_transforms = v2.Compose([
+    v2.Resize((IMG_RESOLUTION, IMG_RESOLUTION)),
+    v2.ToImage(),
+    v2.ToDtype(torch.float32, scale=True),
+    v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+])
+
+
+train_dataset = MultiViewCigaretteDataset(FINAL_CLEAN_CSV, split='train', num_views=6, transform=multiview_train_transforms)
+val_dataset   = MultiViewCigaretteDataset(FINAL_CLEAN_CSV, split='val',   num_views=6, transform=multiview_test_transforms)
+test_dataset  = MultiViewCigaretteDataset(FINAL_CLEAN_CSV, split='test',  num_views=6, transform=multiview_test_transforms)
+
+train_counts = np.bincount(train_dataset.box_labels, minlength=len(CLASS_LABELS))
+
+sampler_class_weights = 1.0 / np.maximum(train_counts, 1)
+
+sample_weights = [sampler_class_weights[lbl] for lbl in train_dataset.box_labels]
+sample_weights_tensor = torch.DoubleTensor(sample_weights)
+
+
+train_sampler = WeightedRandomSampler(
+    weights=sample_weights_tensor,
+    num_samples=len(sample_weights_tensor),
+    replacement=True
+)
+
+BATCH_SIZE = 16
+NUM_WORKERS = 8
+
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=train_sampler, num_workers=NUM_WORKERS, pin_memory=True, drop_last=True)
+val_loader   = DataLoader(val_dataset,   batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+test_loader  = DataLoader(test_dataset,  batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS, pin_memory=True)
+
+print("\n✅ SECTION 9 COMPLETE: HIGH-RESOLUTION MULTI-VIEW DATALOADERS INITIALIZED")
+print(f"   Train Multi-View Box Batches: {len(train_loader)}")
+print(f"   Val Multi-View Box Batches:   {len(val_loader)}")
+print(f"   Test Multi-View Box Batches:  {len(test_loader)}")
+print(f"   Train Box Class Counts -> {dict(zip(CLASS_LABELS, train_counts))}")
