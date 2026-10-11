@@ -1,7 +1,6 @@
 import torch
 import os
 
-
 print("=" * 85)
 print("GPU DEVICE COMPATIBILITY CONFIGURATION")
 print("=" * 85)
